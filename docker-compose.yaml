@@ -1,17 +1,262 @@
+# docker-compose.yaml - Kompletný Docker Compose súbor
+version: '3.8'
+
 services:
   sktorrent-hybrid:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: ${NODE_ENV:-production}
     container_name: sktorrent-hybrid
     restart: unless-stopped
+    
     ports:
-      - "127.0.0.1:7000:7000"
+      - "7000:7000"
+    
     environment:
+      # Základná konfigurácia
+      - NODE_ENV=${NODE_ENV:-production}
+      - PORT=7000
+      - EXTERNAL_DOMAIN=${EXTERNAL_DOMAIN:-localhost}
+      
+      # API Keys
+      - ADDON_API_KEY=${ADDON_API_KEY}
       - REALDEBRID_API_KEY=${REALDEBRID_API_KEY}
+      
+      # SKTorrent konfigurácia
       - SKT_UID=${SKT_UID}
       - SKT_PASS=${SKT_PASS}
-      - ADDON_API_KEY=${ADDON_API_KEY}
-      - STREAM_MODE=${STREAM_MODE}
-      - NODE_ENV=production
-      - EXTERNAL_DOMAIN=${EXTERNAL_DOMAIN}
-    env_file:
-      - .env
+      
+      # NOVÉ - Streaming konfigurácia
+      - STREAMING_METHOD=${STREAMING_METHOD:-PROXY}
+      - STREAM_MODE=${STREAM_MODE:-BOTH}
+      
+      # Direct streaming nastavenia
+      - DIRECT_LINK_EXPIRY=${DIRECT_LINK_EXPIRY:-60}
+      - USE_SIGNED_URLS=${USE_SIGNED_URLS:-true}
+      - FALLBACK_TO_PROXY=${FALLBACK_TO_PROXY:-true}
+      - VERIFY_BEFORE_REDIRECT=${VERIFY_BEFORE_REDIRECT:-false}
+      - MAX_REQUESTS_PER_MINUTE=${MAX_REQUESTS_PER_MINUTE:-30}
+      - URL_VERIFICATION_CACHE=${URL_VERIFICATION_CACHE:-300}
+      
+      # Proxy streaming nastavenia
+      - PROXY_TIMEOUT=${PROXY_TIMEOUT:-30000}
+      - PROXY_MAX_REDIRECTS=${PROXY_MAX_REDIRECTS:-3}
+      - PROXY_BUFFER_SIZE=${PROXY_BUFFER_SIZE:-65536}
+      - PROXY_KEEP_ALIVE=${PROXY_KEEP_ALIVE:-true}
+      
+      # Hybrid streaming nastavenia
+      - SMALL_FILE_THRESHOLD=${SMALL_FILE_THRESHOLD:-524288000}
+      - SERVER_LOAD_THRESHOLD=${SERVER_LOAD_THRESHOLD:-80}
+      - MOBILE_PREFER_DIRECT=${MOBILE_PREFER_DIRECT:-true}
+      
+      # Bezpečnostné nastavenia
+      - REQUIRE_API_KEY=${REQUIRE_API_KEY:-true}
+      - IP_WHITELIST=${IP_WHITELIST:-}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - GLOBAL_RATE_LIMIT=${GLOBAL_RATE_LIMIT:-100}
+      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-3600000}
+      
+      # Vyhľadávanie a cache
+      - MAX_SEARCH_RESULTS=${MAX_SEARCH_RESULTS:-20}
+      - SEARCH_TIMEOUT=${SEARCH_TIMEOUT:-15000}
+      - SEARCH_RETRY_ATTEMPTS=${SEARCH_RETRY_ATTEMPTS:-3}
+      - CACHE_ENABLED=${CACHE_ENABLED:-true}
+      - CACHE_TTL=${CACHE_TTL:-3600}
+      - CACHE_MAX_SIZE=${CACHE_MAX_SIZE:-1000}
+      
+      # Logovanie
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ENABLE_ACCESS_LOG=${ENABLE_ACCESS_LOG:-true}
+      - ENABLE_ERROR_LOG=${ENABLE_ERROR_LOG:-true}
+      - LOG_DIRECTORY=/app/logs
+      
+      # Development nastavenia
+      - ENABLE_MOCK_DATA=${ENABLE_MOCK_DATA:-false}
+      - ENABLE_DEBUG_LOGS=${ENABLE_DEBUG_LOGS:-false}
+      - DISABLE_SSL_VERIFY=${DISABLE_SSL_VERIFY:-false}
+    
+    volumes:
+      # Logy
+      - ./logs:/app/logs:rw
+      
+      # Cache (voliteľné, pre persistent cache)
+      - ./cache:/app/cache:rw
+      
+      # Konfigurácia (ak chcete externe konfiguračné súbory)
+      # - ./config:/app/config:ro
+    
+    networks:
+      - sktorrent-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sktorrent.rule=Host(`${EXTERNAL_DOMAIN}`)"
+      - "traefik.http.routers.sktorrent.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sktorrent.loadbalancer.server.port=7000"
+      - "com.docker.compose.service=sktorrent-hybrid"
+      - "com.docker.compose.version=${COMPOSE_VERSION:-2.0.0}"
+    
+    depends_on:
+      - redis
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.5'
+
+  # Redis pre cache a session storage
+  redis:
+    image: redis:7-alpine
+    container_name: sktorrent-redis
+    restart: unless-stopped
+    
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    
+    volumes:
+      - redis-data:/data
+    
+    networks:
+      - sktorrent-network
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
+
+  # Nginx reverse proxy (voliteľné)
+  nginx:
+    image: nginx:alpine
+    container_name: sktorrent-nginx
+    restart: unless-stopped
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx:rw
+    
+    networks:
+      - sktorrent-network
+    
+    depends_on:
+      - sktorrent-hybrid
+    
+    environment:
+      - NGINX_HOST=${EXTERNAL_DOMAIN:-localhost}
+      - NGINX_PORT=80
+    
+    labels:
+      - "com.docker.compose.service=nginx"
+      - "com.docker.compose.version=${COMPOSE_VERSION:-2.0.0}"
+
+  # Monitoring s Prometheus (voliteľné)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: sktorrent-prometheus
+    restart: unless-stopped
+    
+    ports:
+      - "9090:9090"
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    
+    networks:
+      - sktorrent-network
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    
+    profiles: ["monitoring"]
+
+  # Grafana pre visualizáciu (voliteľné)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: sktorrent-grafana
+    restart: unless-stopped
+    
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    
+    networks:
+      - sktorrent-network
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    
+    depends_on:
+      - prometheus
+    
+    profiles: ["monitoring"]
+
+# Sieťová konfigurácia
+networks:
+  sktorrent-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volume konfigurácia
+volumes:
+  redis-data:
+    driver: local
+  
+  prometheus-data:
+    driver: local
+  
+  grafana-data:
+    driver: local
+
+# =============================================================================
+# PROFILY PRE RÔZNE SCENÁRE NASADENIA
+# =============================================================================
+
+# Profil: basic (iba addon)
+# docker-compose up sktorrent-hybrid
+
+# Profil: with-proxy (addon + nginx)
+# docker-compose --profile proxy up
+
+# Profil: monitoring (všetko + monitoring)
+# docker-compose --profile monitoring up
+
+# Profil: development (s debug nástrojmi)
+# docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
