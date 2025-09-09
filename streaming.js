@@ -1,756 +1,702 @@
+// streaming.js - Kompletní StreamingManager
+const config = require('./config');
+const crypto = require('crypto');
 const axios = require('axios');
-const parseTorrent = require('parse-torrent');
+const { performance } = require('perf_hooks');
 
-// --- LRU cache pro HEAD dotazy a chybové stavy RD ---
-function createLRUCache(maxSize = 300) {
-    const cache = new Map();
-    return {
-        get(key) {
-            if (!cache.has(key)) return null;
-            const value = cache.get(key);
-            cache.delete(key);
-            cache.set(key, value);
-            return value;
-        },
-        set(key, value) {
-            if (cache.has(key)) cache.delete(key);
-            cache.set(key, value);
-            if (cache.size > maxSize) {
-                const firstKey = cache.keys().next().value;
-                cache.delete(firstKey);
-            }
-        },
-        delete(key) {
-            cache.delete(key);
-        },
-        clear() {
-            cache.clear();
-        },
-        size() {
-            return cache.size;
-        }
-    };
-}
-
-function createStreamingManager(apiClient) {
-    const activeProcessing = new Map();
-    const rdCache = new Map();
-    const activeStreams = new Map();
-    const CACHE_DURATION = 10 * 60 * 1000;
-    const headCache = createLRUCache(300);
-    const rdErrorCache = createLRUCache(300);
-    let lastCleanup = 0;
-
-    function getStreamKey(req, url) {
-        const { ip, method, headers: { range } } = req;
-        const baseKey = `${ip}_${url}`;
-        if (method === 'HEAD') return `${baseKey}_HEAD`;
-        if (range) return `${baseKey}_RANGE_${range}`;
-        return `${baseKey}_FULL`;
+class StreamingManager {
+    constructor() {
+        this.streamingMethod = config.getStreamingMethod();
+        this.rateLimitMap = new Map();
+        this.urlVerificationCache = new Map();
+        this.serverMetrics = {
+            totalRequests: 0,
+            directRequests: 0,
+            proxyRequests: 0,
+            hybridRequests: 0,
+            errors: 0,
+            lastReset: Date.now()
+        };
+        
+        // Cleanup rate limit map každých 5 minút
+        setInterval(() => this.cleanupRateLimit(), 5 * 60 * 1000);
+        
+        // Reset metrics každú hodinu
+        setInterval(() => this.resetMetrics(), 60 * 60 * 1000);
+        
+        console.log(`🚀 StreamingManager inicializovaný s metódou: ${this.streamingMethod}`);
     }
 
-    // ✅ NOVÁ funkce pro získání torrent dat z cache
-    const getTorrentDataFromCache = async (infoHash, torrentSearchManager, config, torrentDataCache) => {
-        console.log(`📦 Získávám torrent data pro RD upload: ${infoHash}`);
-
-        if (!torrentDataCache) {
-            throw new Error(`TorrentDataCache není k dispozici pro ${infoHash}`);
-        }
-
-        const cachedData = torrentDataCache.get(infoHash);
-        if (!cachedData || !cachedData.originalTorrent) {
-            throw new Error(`Cached torrent data nenalezena pro ${infoHash} - stream handler možná selhal`);
-        }
-
-        console.log(`💾 Použiji POUZE cached torrent data: ${cachedData.originalTorrent.name}`);
-        console.log(`🔍 Cached context: ${cachedData.searchContext?.query} (${cachedData.searchContext?.type})`);
-
+    /**
+     * Hlavná funkcia pre spracovanie stream požiadavky
+     */
+    async handleStreamRequest(req, res, rdUrl, torrentInfo) {
+        const startTime = performance.now();
+        this.serverMetrics.totalRequests++;
+        
         try {
-            // Stáhneme původní torrent soubor z cached URL
-            const { data } = await apiClient.get(cachedData.originalTorrent.downloadUrl, {
-                responseType: "arraybuffer",
-                headers: {
-                    Cookie: `uid=${config.SKT_UID}; pass=${config.SKT_PASS}`,
-                    Referer: config.BASE_URL || 'https://sktorrent.eu',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-            });
-
-            // ✅ Ověření, že je to správný torrent
-            const parsed = parseTorrent(data);
-            console.log(`🎯 InfoHash check: očekávaný=${infoHash}, skutečný=${parsed.infoHash}`);
+            // Validácia vstupov
+            this.validateInputs(rdUrl, torrentInfo);
             
-            if (parsed.infoHash.toLowerCase() !== infoHash.toLowerCase()) {
-                throw new Error(`InfoHash mismatch: očekávaný ${infoHash}, ale torrent má ${parsed.infoHash}`);
+            // Rate limiting check
+            this.checkRateLimit(req.ip);
+            
+            let result;
+            switch (this.streamingMethod) {
+                case 'DIRECT':
+                    this.serverMetrics.directRequests++;
+                    result = await this.handleDirectStream(req, res, rdUrl, torrentInfo);
+                    break;
+                    
+                case 'PROXY':
+                    this.serverMetrics.proxyRequests++;
+                    result = await this.handleProxyStream(req, res, rdUrl, torrentInfo);
+                    break;
+                    
+                case 'HYBRID':
+                    this.serverMetrics.hybridRequests++;
+                    result = await this.handleHybridStream(req, res, rdUrl, torrentInfo);
+                    break;
+                    
+                default:
+                    console.warn(`Neznáma streaming metóda: ${this.streamingMethod}, používam PROXY`);
+                    this.serverMetrics.proxyRequests++;
+                    result = await this.handleProxyStream(req, res, rdUrl, torrentInfo);
+                    break;
             }
             
-            console.log(`✅ Torrent data úspěšně získána pro RD upload (${data.byteLength} bytes)`);
-            return data; // Vrátí Buffer s torrent daty
+            // Logovanie úspešného requestu
+            this.logStreamRequest('SUCCESS', this.streamingMethod, torrentInfo, req.ip, performance.now() - startTime);
+            return result;
             
         } catch (error) {
-            console.error(`❌ Chyba při získávání torrent dat z cached URL: ${error.message}`);
-            throw error;
-        }
-    };
-
-    // ✅ ZACHOVANÁ funkce buildCompleteMagnetLink pro Stremio kompatibilitu
-    const buildCompleteMagnetLink = async (infoHash, torrentSearchManager, config, torrentDataCache) => {
-        console.log(`🧲 Sestavuji kompletní magnet link pro ${infoHash}`);
-
-        if (!torrentDataCache) {
-            throw new Error(`TorrentDataCache není k dispozici pro ${infoHash}`);
-        }
-
-        const cachedData = torrentDataCache.get(infoHash);
-        if (!cachedData || !cachedData.originalTorrent) {
-            throw new Error(`Cached torrent data nenalezena pro ${infoHash} - stream handler možná selhal`);
-        }
-
-        console.log(`💾 Použiji POUZE cached torrent data: ${cachedData.originalTorrent.name}`);
-        console.log(`🔍 Cached context: ${cachedData.searchContext?.query} (${cachedData.searchContext?.type})`);
-
-        try {
-            // Stáhneme původní torrent soubor z cached URL
-            const { data } = await apiClient.get(cachedData.originalTorrent.downloadUrl, {
-                responseType: "arraybuffer",
-                headers: {
-                    Cookie: `uid=${config.SKT_UID}; pass=${config.SKT_PASS}`,
-                    Referer: config.BASE_URL || 'https://sktorrent.eu',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            this.serverMetrics.errors++;
+            console.error('❌ Chyba pri streamingu:', error.message);
+            
+            // Fallback logika
+            if (config.DIRECT_STREAMING.FALLBACK_TO_PROXY && 
+                this.streamingMethod !== 'PROXY' && 
+                !error.message.includes('Rate limit') &&
+                !error.message.includes('Validation error')) {
+                
+                console.log('🔄 Pokúšam sa o fallback na proxy streaming...');
+                try {
+                    const fallbackResult = await this.handleProxyStream(req, res, rdUrl, torrentInfo);
+                    this.logStreamRequest('FALLBACK_SUCCESS', 'PROXY', torrentInfo, req.ip, performance.now() - startTime);
+                    return fallbackResult;
+                } catch (fallbackError) {
+                    console.error('❌ Fallback proxy tiež zlyhal:', fallbackError.message);
                 }
-            });
-
-            // ✅ Použití parse-torrent pro parsování
-            const parsed = parseTorrent(data);
-            
-            console.log(`🔍 Parsed torrent data:`, {
-                infoHash: parsed.infoHash,
-                name: parsed.name,
-                length: parsed.length,
-                announceLength: parsed.announce?.length,
-                files: parsed.files?.length
-            });
-            
-            // ✅ SPRÁVNÉ pořadí parametrů jako ve vašem externím magnet linku
-            const magnetParams = [];
-            
-            // ✅ xl parametr PRVNÍ
-            if (parsed.length) {
-                magnetParams.push(`xl=${parsed.length}`);
-                console.log(`📏 Přidávám xl parametr jako první: ${parsed.length} bytes`);
             }
             
-            // Potom xt parametr
-            magnetParams.push(`xt=urn:btih:${parsed.infoHash}`);
+            // Error response
+            this.logStreamRequest('ERROR', this.streamingMethod, torrentInfo, req.ip, performance.now() - startTime, error.message);
             
-            // Display name
-            if (parsed.name) {
-                magnetParams.push(`dn=${encodeURIComponent(parsed.name)}`);
-            }
-            
-            // Trackery
-            if (parsed.announce && parsed.announce.length > 0) {
-                parsed.announce.forEach(tracker => {
-                    magnetParams.push(`tr=${encodeURIComponent(tracker)}`);
+            if (!res.headersSent) {
+                return res.status(500).json({ 
+                    error: 'Chyba pri streamingu',
+                    details: config.isDevelopment() ? error.message : 'Internal server error',
+                    method: this.streamingMethod,
+                    fallbackAvailable: config.DIRECT_STREAMING.FALLBACK_TO_PROXY && this.streamingMethod !== 'PROXY'
                 });
             }
-            
-            // Sestavení finálního magnet linku
-            const completeMagnet = `magnet:?${magnetParams.join('&')}`;
-            
-            console.log(`✅ Kompletní magnet link sestaven s xl parametrem na první pozici`);
-            console.log(`🎯 InfoHash check: očekávaný=${infoHash}, skutečný=${parsed.infoHash}`);
-            console.log(`📏 Velikost: ${parsed.length} bytes`);
-            
-            // ✅ Kontrola, že xl parametr je na první pozici
-            if (completeMagnet.startsWith(`magnet:?xl=${parsed.length}&xt=`)) {
-                console.log(`✅ xl parametr správně na první pozici: xl=${parsed.length}`);
-            } else {
-                console.error(`❌ xl parametr není na první pozici!`);
-            }
-            
-            console.log(`🧲 Finální magnet: ${completeMagnet.substring(0, 120)}...`);
-            
-            // ✅ Dodatečná kontrola, že hash sedí
-            if (parsed.infoHash.toLowerCase() !== infoHash.toLowerCase()) {
-                throw new Error(`InfoHash mismatch: očekávaný ${infoHash}, ale torrent má ${parsed.infoHash}`);
-            }
-            
-            return completeMagnet;
-            
-        } catch (error) {
-            console.error(`❌ Chyba při sestavování magnet linku z cached dat: ${error.message}`);
-            throw error;
         }
-    };
+    }
 
-    // ✅ OPRAVENÁ streamFromUrl funkce s lepším error handlingem
-    async function streamFromUrl(url, req, res, source) {
-        const streamKey = getStreamKey(req, url);
-        const baseKey = `${req.ip}_${url}`;
-        const { range } = req.headers;
-        const isRangeRequest = range && range.includes('bytes=');
-
-        if (!isRangeRequest && activeStreams.has(`${baseKey}_FULL`)) {
-            const existingStream = activeStreams.get(`${baseKey}_FULL`);
-            if (Date.now() - existingStream < 5000) {
-                console.log(`⚠️ Základní stream nedávno spuštěn pro ${baseKey}, čekám...`);
-                return;
-            }
+    /**
+     * Direct streaming - redirect na Real-Debrid URL
+     */
+    async handleDirectStream(req, res, rdUrl, torrentInfo) {
+        console.log(`🎬 Direct streaming: ${torrentInfo.title} (${this.formatFileSize(torrentInfo.size)})`);
+        
+        // Validácia URL
+        if (!this.isValidRdUrl(rdUrl)) {
+            throw new Error('Neplatné Real-Debrid URL');
         }
 
+        // Test pripojenia k RD (ak je povolený)
+        if (config.DIRECT_STREAMING.VERIFY_BEFORE_REDIRECT) {
+            await this.verifyRdUrlAccessible(rdUrl);
+        }
+
+        // Vytvorenie finálneho URL
+        let finalUrl = rdUrl;
+        if (config.DIRECT_STREAMING.USE_SIGNED_URLS) {
+            finalUrl = this.createSignedUrl(rdUrl, torrentInfo);
+        }
+
+        // Nastavenie headers pre optimálne video streaming
+        this.setStreamingHeaders(res, torrentInfo, 'DIRECT');
+        
+        console.log(`↗️ Direct redirect na Real-Debrid (expires: ${config.DIRECT_STREAMING.LINK_EXPIRY}min)`);
+        return res.redirect(302, finalUrl);
+    }
+
+    /**
+     * Proxy streaming - data idú cez náš server
+     */
+    async handleProxyStream(req, res, rdUrl, torrentInfo) {
+        console.log(`🔄 Proxy streaming: ${torrentInfo.title} (${this.formatFileSize(torrentInfo.size)})`);
+        
+        if (!this.isValidRdUrl(rdUrl)) {
+            throw new Error('Neplatné Real-Debrid URL');
+        }
+
+        // Príprava headers pre request
+        const requestHeaders = this.buildProxyHeaders(req);
+        
         try {
-            activeStreams.set(streamKey, Date.now());
-            console.log(`🔄 Spouštím ${source} stream: ${req.method} ${range ? `Range: ${range}` : 'FULL'}`);
-            console.log(`🌐 Stream URL: ${url}`);
+            const axiosConfig = {
+                method: 'GET',
+                url: rdUrl,
+                headers: requestHeaders,
+                responseType: 'stream',
+                timeout: config.PROXY_STREAMING.TIMEOUT,
+                maxRedirects: config.PROXY_STREAMING.MAX_REDIRECTS,
+                validateStatus: (status) => status < 500 // Accept redirects and client errors
+            };
 
-            // ✅ OPRAVA: Nejprve zkontroluj URL dostupnost
-            let response;
-            try {
-                response = await apiClient.get(url, {
-                    responseType: 'stream',
-                    headers: { 
-                        'Range': range || 'bytes=0-',
-                        'User-Agent': 'SKTorrent-Hybrid/1.0.0'
-                    },
-                    timeout: 30000,
-                    validateStatus: function (status) {
-                        return status >= 200 && status < 400; // Povolí redirects
-                    }
-                });
-            } catch (urlError) {
-                console.error(`❌ Chyba při načítání URL: ${urlError.message}`);
-                if (urlError.response) {
-                    console.error(`📋 Status: ${urlError.response.status}, Headers:`, urlError.response.headers);
-                }
-                throw urlError;
-            }
-
-            const { headers, data, status } = response;
+            console.log(`📡 Pripájam sa k Real-Debrid...`);
+            const streamResponse = await axios(axiosConfig);
             
-            // ✅ OPRAVA: Debug response headers
-            console.log(`📊 Response status: ${status}`);
-            console.log(`📋 Response headers:`, {
-                'content-type': headers['content-type'],
-                'content-length': headers['content-length'],
-                'content-range': headers['content-range'],
-                'accept-ranges': headers['accept-ranges']
-            });
-
-            const responseHeaders = {
-                'Content-Type': headers['content-type'] || 'video/mp4',
-                'Accept-Ranges': 'bytes',
-                'Cache-Control': 'no-cache, no-store',
-                'Connection': 'keep-alive'
-            };
-
-            // ✅ OPRAVA: Lepší handling Content-Length
-            if (headers['content-length']) {
-                responseHeaders['Content-Length'] = headers['content-length'];
-                console.log(`📏 Content-Length: ${headers['content-length']} bytes`);
-            } else {
-                console.warn(`⚠️ Content-Length chybí v response headers`);
+            // Check for error status codes
+            if (streamResponse.status >= 400) {
+                throw new Error(`Real-Debrid error: ${streamResponse.status} ${streamResponse.statusText}`);
             }
 
-            if (range && status === 206) {
-                res.status(206);
-                if (headers['content-range']) {
-                    responseHeaders['Content-Range'] = headers['content-range'];
-                    console.log(`📍 Range stream: ${headers['content-range']}`);
-                } else {
-                    console.warn(`⚠️ Content-Range chybí pro 206 response`);
-                }
-            } else {
-                res.status(200);
-                console.log(`📺 Full stream: ${responseHeaders['Content-Length'] || 'unknown size'} bytes`);
-            }
-
-            res.set(responseHeaders);
-
-            // ✅ OPRAVA: Lepší stream handling s error listenery
-            let streamEnded = false;
-            const cleanup = () => {
-                if (!streamEnded) {
-                    streamEnded = true;
-                    activeStreams.delete(streamKey);
-                    console.log(`🧹 Stream cleanup: ${streamKey}`);
-                }
-            };
-
-            // ✅ OPRAVA: Error handling před pipe
-            data.on('error', err => {
-                console.error(`❌ ${source} stream data error: ${err.message}`);
-                cleanup();
-                if (!res.headersSent) {
+            // Nastavenie response headers
+            this.setProxyResponseHeaders(res, streamResponse.headers, req.headers.range, torrentInfo);
+            
+            console.log(`🔄 Streaming ${this.formatFileSize(streamResponse.headers['content-length'])} cez proxy server`);
+            
+            // Error handling pre stream
+            streamResponse.data.on('error', (error) => {
+                console.error('❌ Stream pipe error:', error.message);
+                if (!res.destroyed && !res.headersSent) {
                     res.status(500).end();
-                } else if (!res.destroyed) {
-                    res.destroy();
                 }
             });
 
-            data.on('end', () => {
-                console.log(`✅ ${source} stream ended normally`);
-                cleanup();
-            });
-
-            data.on('close', () => {
-                console.log(`🔒 ${source} stream closed`);
-                cleanup();
-            });
-
+            // Connection handling
             req.on('close', () => {
-                console.log(`🔒 Client disconnected from ${source} stream`);
-                cleanup();
-                if (!data.destroyed) {
-                    data.destroy();
+                if (streamResponse.data && !streamResponse.data.destroyed) {
+                    streamResponse.data.destroy();
                 }
             });
 
             req.on('aborted', () => {
-                console.log(`🚫 Client aborted ${source} stream`);
-                cleanup();
-                if (!data.destroyed) {
-                    data.destroy();
+                if (streamResponse.data && !streamResponse.data.destroyed) {
+                    streamResponse.data.destroy();
                 }
             });
 
-            // ✅ OPRAVA: Pipe s error handling
-            data.pipe(res).on('error', (err) => {
-                console.error(`❌ ${source} pipe error: ${err.message}`);
-                cleanup();
-            });
-
-            console.log(`🚀 ${source} stream pipeline nastavena úspěšně`);
-
-        } catch (error) {
-            activeStreams.delete(streamKey);
-            console.error(`❌ ${source} proxy stream chyba: ${error.message}`);
-            console.error(`📋 Error stack: ${error.stack}`);
+            // Pipe stream data
+            streamResponse.data.pipe(res);
             
-            if (!res.headersSent) {
-                res.status(503).json({
-                    error: `${source} proxy stream chyba`,
-                    message: error.message,
-                    url: url // ✅ Debug info
-                });
+        } catch (error) {
+            console.error('❌ Proxy streaming chyba:', error.message);
+            
+            // Špecifické error handling
+            if (error.code === 'ECONNABORTED') {
+                throw new Error('Timeout pri pripojení k Real-Debrid');
+            } else if (error.code === 'ENOTFOUND') {
+                throw new Error('Real-Debrid server nedostupný');
+            } else if (error.response) {
+                const status = error.response.status;
+                if (status === 404) {
+                    throw new Error('Súbor nebol nájdený na Real-Debrid');
+                } else if (status === 403) {
+                    throw new Error('Prístup k súboru zamietnutý (možno expirovaný link)');
+                } else if (status >= 500) {
+                    throw new Error('Real-Debrid server error');
+                }
             }
+            
+            throw new Error(`Proxy streaming chyba: ${error.message}`);
         }
     }
 
-    const getStreamHeaders = async (infoHash, rd, rdApiKey) => {
-        const now = Date.now();
-        try {
-            const cached = rdCache.get(infoHash);
-            if (cached && cached.expiresAt > now) {
-                if (cached.error) {
-                    console.log(`❌ HEAD: Cache obsahuje chybu pro ${infoHash}`);
-                    return null;
-                }
-                if (cached.links) {
-                    const url = cached.links[0].url;
-                    return await getUrlHeaders(url);
-                }
-            }
-
-            const magnetLink = `magnet:?xt=urn:btih:${infoHash}`;
-            const rdLinks = await rd.addMagnetIfNotExists(rdApiKey, magnetLink, infoHash, 1);
-
-            if (rdLinks && rdLinks.length > 0) {
-                rdCache.set(infoHash, {
-                    timestamp: now,
-                    links: rdLinks,
-                    expiresAt: now + CACHE_DURATION
-                });
-                return await getUrlHeaders(rdLinks[0].url);
-            }
-
-            rdCache.set(infoHash, {
-                timestamp: now,
-                error: true,
-                message: 'HEAD request selhal',
-                expiresAt: now + (CACHE_DURATION / 4)
-            });
-            return null;
-        } catch (error) {
-            console.error(`❌ HEAD request chyba: ${error.message}`);
-            return null;
+    /**
+     * Hybrid streaming - inteligentný výber na základe podmienok
+     */
+    async handleHybridStream(req, res, rdUrl, torrentInfo) {
+        const decision = this.makeHybridDecision(req, torrentInfo);
+        
+        console.log(`🎯 Hybrid rozhodnutie: ${decision.method} (${decision.reason})`);
+        
+        if (decision.method === 'DIRECT') {
+            return await this.handleDirectStream(req, res, rdUrl, torrentInfo);
+        } else {
+            return await this.handleProxyStream(req, res, rdUrl, torrentInfo);
         }
-    };
+    }
 
-    const maybeCleanupCaches = () => {
-        const now = Date.now();
-        if (now - lastCleanup > 10 * 60 * 1000) { // 10 minut
-            headCache.clear();
-            rdErrorCache.clear();
-            lastCleanup = now;
-            console.log('🧹 StreamingManager: cache cleanup');
+    /**
+     * Rozhodovacia logika pre hybrid mód
+     */
+    makeHybridDecision(req, torrentInfo) {
+        const fileSize = torrentInfo.size || 0;
+        const hasRange = !!req.headers.range;
+        const isSmallFile = fileSize < config.HYBRID_STREAMING.SMALL_FILE_THRESHOLD;
+        const isMobile = this.isMobileClient(req);
+        const serverLoad = this.getServerLoad();
+        const isHighQuality = this.isHighQualityContent(torrentInfo);
+        
+        // Pravidlá pre direct streaming (v poradí priority)
+        
+        // 1. Vysoká záťaž servera -> direct
+        if (serverLoad > config.HYBRID_STREAMING.SERVER_LOAD_THRESHOLD) {
+            return { method: 'DIRECT', reason: `vysoká záťaž servera (${serverLoad}%)` };
         }
-    };
-
-    const getUrlHeaders = async (url) => {
-        const cached = headCache.get(url);
-        if (cached && cached.expires > Date.now()) return cached.value;
-
-        try {
-            const { headers } = await apiClient.head(url);
-            const value = {
-                'Content-Type': headers['content-type'] || 'video/mp4',
-                'Content-Length': headers['content-length'],
-                'Accept-Ranges': 'bytes',
-                'Cache-Control': 'no-cache'
-            };
-            headCache.set(url, { value, expires: Date.now() + 10 * 60 * 1000 }); // 10 min
-            return value;
-        } catch (error) {
-            console.error(`❌ HEAD URL chyba: ${error.message}`);
-            headCache.set(url, { value: {
-                'Content-Type': 'video/mp4',
-                'Accept-Ranges': 'bytes'
-            }, expires: Date.now() + 2 * 60 * 1000 }); // 2 min pro chybu
-            return {
-                'Content-Type': 'video/mp4',
-                'Accept-Ranges': 'bytes'
-            };
+        
+        // 2. Malý súbor bez range -> direct
+        if (isSmallFile && !hasRange) {
+            return { method: 'DIRECT', reason: `malý súbor (${this.formatFileSize(fileSize)}) bez range` };
         }
-    };
+        
+        // 3. Mobilný klient a malý súbor -> direct (ak je povolené)
+        if (isMobile && config.HYBRID_STREAMING.MOBILE_PREFER_DIRECT && isSmallFile) {
+            return { method: 'DIRECT', reason: 'mobilný klient s malým súborom' };
+        }
+        
+        // 4. Veľmi malý súbor (< 100MB) -> vždy direct
+        if (fileSize < 100 * 1024 * 1024) {
+            return { method: 'DIRECT', reason: `veľmi malý súbor (${this.formatFileSize(fileSize)})` };
+        }
+        
+        // 5. High-quality obsah s range requests -> proxy (lepšia kontrola)
+        if (isHighQuality && hasRange) {
+            return { method: 'PROXY', reason: `vysoká kvalita s range requests` };
+        }
+        
+        // Default rozhodnutie na základe celkovej situácie
+        if (serverLoad < 30 && !isMobile) {
+            return { method: 'PROXY', reason: 'nízka záťaž servera, desktop klient' };
+        }
+        
+        return { method: 'DIRECT', reason: 'default voľba pre optimalizáciu' };
+    }
 
-    const cacheRDError = (infoHash, message) => {
-        rdErrorCache.set(infoHash, { error: true, message, expires: Date.now() + 5 * 60 * 1000 }); // 5 min
-    };
+    /**
+     * Validácia vstupných parametrov
+     */
+    validateInputs(rdUrl, torrentInfo) {
+        if (!rdUrl || typeof rdUrl !== 'string') {
+            throw new Error('Validation error: Chýba Real-Debrid URL');
+        }
+        
+        if (!torrentInfo || typeof torrentInfo !== 'object') {
+            throw new Error('Validation error: Chýbajú informácie o torrente');
+        }
+        
+        if (!torrentInfo.title) {
+            throw new Error('Validation error: Chýba názov torrenta');
+        }
+    }
 
-    const getRDError = (infoHash) => {
-        const cached = rdErrorCache.get(infoHash);
-        if (cached && cached.expires > Date.now()) return cached;
-        if (cached) rdErrorCache.delete(infoHash);
-        return null;
-    };
-
-    // ✅ OPRAVENÁ debugTorrent funkce s torrentDataCache
-    const debugTorrent = async (infoHash, torrentSearchManager, rd, rdApiKey, torrentDataCache) => {
-        const debugInfo = {
-            infoHash,
-            timestamp: new Date().toISOString(),
-            steps: []
-        };
-
+    /**
+     * Validácia Real-Debrid URL
+     */
+    isValidRdUrl(url) {
+        if (!url || typeof url !== 'string') return false;
+        
+        // Real-Debrid domény
+        const validDomains = [
+            'real-debrid.com',
+            'rd.rdeb.io',
+            'fc.rdeb.io',
+            'rdeb.io',
+            'real-debrid.org'
+        ];
+        
         try {
-            debugInfo.steps.push('🔍 Začínám debug analýzu...');
+            const parsedUrl = new URL(url);
+            const isValidDomain = validDomains.some(domain => 
+                parsedUrl.hostname === domain || parsedUrl.hostname.endsWith('.' + domain)
+            );
             
-            // ✅ Zkontroluj cached data
-            if (torrentDataCache) {
-                const cachedData = torrentDataCache.get(infoHash);
-                if (cachedData) {
-                    debugInfo.steps.push('💾 Nalezena cached torrent data!');
-                    debugInfo.cacheData = {
-                        originalTorrent: cachedData.originalTorrent,
-                        searchContext: cachedData.searchContext,
-                        cached: new Date(cachedData.cached).toISOString()
-                    };
-                    debugInfo.torrentDetails = {
-                        sktId: cachedData.originalTorrent.id,
-                        sktName: cachedData.originalTorrent.name,
-                        sktCategory: cachedData.originalTorrent.category,
-                        sktSeeds: cachedData.originalTorrent.seeds,
-                        sktSize: cachedData.originalTorrent.size,
-                        downloadUrl: cachedData.originalTorrent.downloadUrl,
-                        calculatedHash: cachedData.torrentInfo.infoHash
-                    };
-                } else {
-                    debugInfo.steps.push('❌ Žádná cached data nenalezena');
-                }
+            if (!isValidDomain) {
+                console.warn(`⚠️ Neplatná RD doména: ${parsedUrl.hostname}`);
+                return false;
             }
-
-            // ✅ Testování torrent dat pro RD
-            debugInfo.steps.push('📦 Zkouším získat torrent data pro RD...');
-            try {
-                const torrentData = await getTorrentDataFromCache(infoHash, torrentSearchManager, {
-                    SKT_UID: process.env.SKT_UID,
-                    SKT_PASS: process.env.SKT_PASS,
-                    BASE_URL: process.env.BASE_URL || 'https://sktorrent.eu'
-                }, torrentDataCache);
-                debugInfo.steps.push(`✅ Torrent data získána (${torrentData.byteLength} bytes)`);
-                debugInfo.torrentDataSize = torrentData.byteLength;
-            } catch (torrentError) {
-                debugInfo.steps.push(`❌ Chyba při získávání torrent dat: ${torrentError.message}`);
-                debugInfo.torrentError = torrentError.message;
+            
+            // Check protocol
+            if (!['https:', 'http:'].includes(parsedUrl.protocol)) {
+                console.warn(`⚠️ Neplatný protokol: ${parsedUrl.protocol}`);
+                return false;
             }
-
-            // ✅ Sestavení magnet linku pro Stremio kompatibilitu
-            debugInfo.steps.push('🧲 Sestavuji magnet link pro Stremio...');
-            try {
-                const completeMagnet = await buildCompleteMagnetLink(infoHash, torrentSearchManager, {
-                    SKT_UID: process.env.SKT_UID,
-                    SKT_PASS: process.env.SKT_PASS,
-                    BASE_URL: process.env.BASE_URL || 'https://sktorrent.eu'
-                }, torrentDataCache);
-                debugInfo.magnetLink = completeMagnet;
-                debugInfo.steps.push(`🧲 Magnet link: ${completeMagnet}`);
-            } catch (magnetError) {
-                debugInfo.steps.push(`❌ Chyba při sestavování magnet linku: ${magnetError.message}`);
-                debugInfo.magnetError = magnetError.message;
-            }
-
-            if (rd && debugInfo.torrentDataSize) {
-                debugInfo.steps.push('🔄 Testování Real-Debrid s torrent souborem (PUT metoda)...');
-                try {
-                    const torrentData = await getTorrentDataFromCache(infoHash, torrentSearchManager, {
-                        SKT_UID: process.env.SKT_UID,
-                        SKT_PASS: process.env.SKT_PASS,
-                        BASE_URL: process.env.BASE_URL || 'https://sktorrent.eu'
-                    }, torrentDataCache);
-                    
-                    const rdResult = await rd.addTorrentIfNotExists(rdApiKey, torrentData, infoHash);
-                    if (rdResult && rdResult.length > 0) {
-                        debugInfo.steps.push(`✅ Úspěšně přidáno do RD pomocí PUT metody!`);
-                        debugInfo.rdLinks = rdResult.slice(0, 3);
-                    } else {
-                        debugInfo.steps.push(`❌ Nepodařilo se přidat do RD`);
-                    }
-                } catch (rdError) {
-                    debugInfo.steps.push(`❌ RD API chyba: ${rdError.message}`);
-                    debugInfo.rdError = rdError.message;
-                }
-            }
-
-            debugInfo.steps.push('✅ Debug analýza dokončena!');
-            debugInfo.success = true;
+            
+            return true;
         } catch (error) {
-            debugInfo.steps.push(`❌ Debug chyba: ${error.message}`);
-            debugInfo.error = error.message;
-            debugInfo.success = false;
+            console.warn(`⚠️ Chyba pri parsovaní URL: ${error.message}`);
+            return false;
         }
+    }
 
-        return debugInfo;
-    };
-
-    // ✅ HLAVNÍ OPRAVENÁ processRealDebridStream - používá PUT torrent upload
-    const processRealDebridStream = async (infoHash, rd, rdApiKey, req, res, torrentSearchManager, config, torrentDataCache) => {
-        maybeCleanupCaches();
-
-        // Zkontroluj RD error cache
-        const cachedError = getRDError(infoHash);
-        if (cachedError) {
-            console.log(`❌ RD error cache hit pro ${infoHash}: ${cachedError.message}`);
-            return null;
+    /**
+     * Test dostupnosti RD URL pred redirect
+     */
+    async verifyRdUrlAccessible(rdUrl) {
+        // Check cache first
+        const cacheKey = crypto.createHash('md5').update(rdUrl).digest('hex');
+        const cached = this.urlVerificationCache.get(cacheKey);
+        
+        if (cached && (Date.now() - cached.timestamp) < config.DIRECT_STREAMING.URL_VERIFICATION_CACHE * 1000) {
+            if (!cached.accessible) {
+                throw new Error('Real-Debrid link je nedostupný (cached)');
+            }
+            return;
         }
-
-        const now = Date.now();
+        
         try {
-            const rangeHeader = req.headers.range;
-            console.log(`🚀 RD ${req.method} pro: ${infoHash}${rangeHeader ? ` Range: ${rangeHeader}` : ''}`);
-
-            const cached = rdCache.get(infoHash);
-            if (cached && cached.expiresAt > now) {
-                if (cached.error) {
-                    console.log(`❌ CACHE ERROR pro ${infoHash}: ${cached.message}`);
-                    return null;
-                }
-                if (cached.links) {
-                    console.log(`🎯 CACHE SUCCESS pro ${infoHash}`);
-                    return cached.links[0].url;
-                }
-            }
-
-            if (activeProcessing.has(infoHash)) {
-                console.log(`⏳ Čekám na aktivní zpracování ${infoHash}`);
-                try {
-                    const result = await activeProcessing.get(infoHash);
-                    if (result && result.length > 0) {
-                        return result[0].url;
-                    } else {
-                        return null;
-                    }
-                } catch (error) {
-                    activeProcessing.delete(infoHash);
-                    return null;
-                }
-            }
-
-            console.log(`🔄 NOVÉ RD zpracování pro ${infoHash}`);
-
-            // ✅ KLÍČOVÁ ZMĚNA: Získej pouze torrent data pro PUT upload
-            const torrentData = await getTorrentDataFromCache(infoHash, torrentSearchManager, config, torrentDataCache);
-            console.log(`📦 Torrent data připravena pro PUT upload (${torrentData.byteLength} bytes)`);
-
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout při čekání na Real-Debrid (2 minuty)')), 2 * 60 * 1000)
-            );
-
-            // ✅ Volej pouze s torrent daty (PUT metoda)
-            const processingPromise = Promise.race([
-                rd.addTorrentIfNotExists(rdApiKey, torrentData, infoHash), // ✅ Pouze torrent data
-                timeoutPromise
-            ]);
-
-            activeProcessing.set(infoHash, processingPromise);
-
-            try {
-                const rdLinks = await processingPromise;
-                activeProcessing.delete(infoHash);
-
-                if (rdLinks && rdLinks.length > 0) {
-                    rdCache.set(infoHash, {
-                        timestamp: now,
-                        links: rdLinks,
-                        expiresAt: now + (rdLinks[0].cacheDuration ?? CACHE_DURATION),
-                    });
-                    return rdLinks[0].url;
-                }
-
-                rdCache.set(infoHash, {
-                    timestamp: now,
-                    error: true,
-                    message: 'Torrent nelze zpracovat (PUT torrent error)',
-                    expiresAt: now + CACHE_DURATION
-                });
-                return null;
-            } catch (error) {
-                activeProcessing.delete(infoHash);
-                console.error(`❌ RD processing error: ${error.message}`);
-                return null;
-            }
+            console.log('🔍 Verifikujem Real-Debrid URL...');
+            const response = await axios.head(rdUrl, { 
+                timeout: 5000,
+                maxRedirects: 2,
+                validateStatus: (status) => status < 400
+            });
+            
+            // Cache successful result
+            this.urlVerificationCache.set(cacheKey, {
+                accessible: true,
+                timestamp: Date.now(),
+                status: response.status
+            });
+            
+            console.log(`✅ RD URL je dostupný (status: ${response.status})`);
+            
         } catch (error) {
-            activeProcessing.delete(infoHash);
-            console.error(`❌ processRealDebridStream error: ${error.message}`);
-            return null;
+            // Cache failed result for shorter time
+            this.urlVerificationCache.set(cacheKey, {
+                accessible: false,
+                timestamp: Date.now(),
+                error: error.message
+            });
+            
+            console.warn(`❌ RD URL verification failed: ${error.message}`);
+            throw new Error('Real-Debrid link je momentálne nedostupný');
         }
-    };
+    }
 
-    const getRealDebridStreamUrl = async (infoHash, rd, rdApiKey, req) => {
-        maybeCleanupCaches();
+    /**
+     * Vytvorenie signed URL s expiry a podpisom
+     */
+    createSignedUrl(rdUrl, torrentInfo) {
+        const expiry = Date.now() + (config.DIRECT_STREAMING.LINK_EXPIRY * 60 * 1000);
+        const payload = `${rdUrl}:${expiry}:${torrentInfo.id || 'unknown'}`;
+        const signature = crypto
+            .createHmac('sha256', config.ADDON_API_KEY)
+            .update(payload)
+            .digest('hex');
+        
+        const separator = rdUrl.includes('?') ? '&' : '?';
+        return `${rdUrl}${separator}_exp=${expiry}&_sig=${signature}&_id=${encodeURIComponent(torrentInfo.id || '')}`;
+    }
 
-        const cachedError = getRDError(infoHash);
-        if (cachedError) {
-            console.log(`❌ RD error cache hit pro ${infoHash}: ${cachedError.message}`);
-            return null;
+    /**
+     * Nastavenie headers pre streaming
+     */
+    setStreamingHeaders(res, torrentInfo, method) {
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', this.getContentType(torrentInfo.title));
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+        res.setHeader('X-Streaming-Method', method);
+        res.setHeader('X-Content-Title', encodeURIComponent(torrentInfo.title));
+        
+        // CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Authorization');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
+        
+        // Security headers
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('X-Frame-Options', 'DENY');
+    }
+
+    /**
+     * Build headers pre proxy request
+     */
+    buildProxyHeaders(req) {
+        const headers = {
+            'User-Agent': 'SKTorrent-Hybrid-Addon/2.0 (Proxy-Mode)',
+            'Accept': '*/*',
+            'Accept-Encoding': 'identity',
+            'Connection': config.PROXY_STREAMING.KEEP_ALIVE ? 'keep-alive' : 'close'
+        };
+        
+        // Forward range header pre seeking
+        if (req.headers.range) {
+            headers.Range = req.headers.range;
+            console.log(`📍 Range request: ${req.headers.range}`);
         }
+        
+        // Forward authorization ak existuje
+        if (req.headers.authorization) {
+            headers.Authorization = req.headers.authorization;
+        }
+        
+        return headers;
+    }
 
+    /**
+     * Nastavenie response headers pre proxy streaming
+     */
+    setProxyResponseHeaders(res, sourceHeaders, requestRange, torrentInfo) {
+        // Content headers
+        if (sourceHeaders['content-length']) {
+            res.setHeader('Content-Length', sourceHeaders['content-length']);
+        }
+        
+        if (sourceHeaders['content-range']) {
+            res.setHeader('Content-Range', sourceHeaders['content-range']);
+        }
+        
+        if (sourceHeaders['content-type']) {
+            res.setHeader('Content-Type', sourceHeaders['content-type']);
+        } else {
+            res.setHeader('Content-Type', this.getContentType(torrentInfo.title));
+        }
+        
+        // Range support
+        res.setHeader('Accept-Ranges', 'bytes');
+        
+        // Streaming optimalizácia
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('X-Streaming-Method', 'PROXY');
+        res.setHeader('X-Proxy-Server', 'SKTorrent-Hybrid');
+        
+        // CORS headers
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
+        
+        // Status code pre range requests
+        if (requestRange && sourceHeaders['content-range']) {
+            res.status(206);
+            console.log(`📍 Partial content response: ${sourceHeaders['content-range']}`);
+        } else {
+            res.status(200);
+        }
+    }
+
+    /**
+     * Detekcia content type na základe názvu súboru
+     */
+    getContentType(filename) {
+        if (!filename) return 'application/octet-stream';
+        
+        const ext = filename.split('.').pop()?.toLowerCase();
+        const videoTypes = {
+            'mp4': 'video/mp4',
+            'avi': 'video/x-msvideo',
+            'mkv': 'video/x-matroska',
+            'mov': 'video/quicktime',
+            'wmv': 'video/x-ms-wmv',
+            'flv': 'video/x-flv',
+            'webm': 'video/webm',
+            'm4v': 'video/mp4',
+            'mpg': 'video/mpeg',
+            'mpeg': 'video/mpeg',
+            '3gp': 'video/3gpp',
+            'ogv': 'video/ogg'
+        };
+        
+        return videoTypes[ext] || 'video/mp4';
+    }
+
+    /**
+     * Rate limiting
+     */
+    checkRateLimit(clientIp) {
         const now = Date.now();
-        try {
-            const cached = rdCache.get(infoHash);
-            if (cached && cached.expiresAt > now) {
-                if (cached.error) {
-                    console.log(`❌ CACHE ERROR pro ${infoHash}: ${cached.message}`);
-                    return null;
-                }
-                if (cached.links) {
-                    console.log(`🎯 CACHE SUCCESS pro ${infoHash}`);
-                    return cached.links[0].url;
-                }
-            }
-
-            if (activeProcessing.has(infoHash)) {
-                console.log(`⏳ Čekám na aktivní zpracování ${infoHash}`);
-                try {
-                    const result = await activeProcessing.get(infoHash);
-                    if (result && result.length > 0) {
-                        return result[0].url;
-                    } else {
-                        return null;
-                    }
-                } catch (error) {
-                    activeProcessing.delete(infoHash);
-                    return null;
-                }
-            }
-
-            console.log(`🔄 NOVÉ RD zpracování pro ${infoHash}`);
-            const magnetLink = `magnet:?xt=urn:btih:${infoHash}`;
-
-            const timeoutPromise = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Timeout při čekání na Real-Debrid (2 minuty)')), 2 * 60 * 1000)
-            );
-
-            const processingPromise = Promise.race([
-                rd.addMagnetIfNotExists(rdApiKey, magnetLink, infoHash, 2),
-                timeoutPromise
-            ]);
-
-            activeProcessing.set(infoHash, processingPromise);
-
-            try {
-                const rdLinks = await processingPromise;
-                activeProcessing.delete(infoHash);
-
-                if (rdLinks && rdLinks.length > 0) {
-                    rdCache.set(infoHash, {
-                        timestamp: now,
-                        links: rdLinks,
-                        expiresAt: now + (rdLinks[0].cacheDuration ?? CACHE_DURATION),
-                    });
-                    return rdLinks[0].url;
-                }
-
-                rdCache.set(infoHash, {
-                    timestamp: now,
-                    error: true,
-                    message: 'Torrent nelze zpracovat (magnet_error)',
-                    expiresAt: now + CACHE_DURATION
-                });
-                return null;
-            } catch (error) {
-                activeProcessing.delete(infoHash);
-                return null;
-            }
-        } catch (error) {
-            activeProcessing.delete(infoHash);
-            return null;
+        const windowMs = 60 * 1000; // 1 minúta
+        const maxRequests = config.DIRECT_STREAMING.MAX_REQUESTS_PER_MINUTE;
+        
+        if (!this.rateLimitMap.has(clientIp)) {
+            this.rateLimitMap.set(clientIp, { 
+                count: 1, 
+                resetTime: now + windowMs,
+                firstRequest: now
+            });
+            return;
         }
-    };
+        
+        const clientData = this.rateLimitMap.get(clientIp);
+        
+        if (now > clientData.resetTime) {
+            // Reset window
+            clientData.count = 1;
+            clientData.resetTime = now + windowMs;
+            clientData.firstRequest = now;
+        } else {
+            clientData.count++;
+        }
+        
+        if (clientData.count > maxRequests) {
+            const remainingTime = Math.ceil((clientData.resetTime - now) / 1000);
+            throw new Error(`Rate limit exceeded: max ${maxRequests} requests per minute. Try again in ${remainingTime}s`);
+        }
+    }
 
-    const cleanupCache = () => {
+    /**
+     * Cleanup rate limit map
+     */
+    cleanupRateLimit() {
         const now = Date.now();
-        let cleanedCache = 0;
-        let cleanedProcessing = 0;
-        let cleanedStreams = 0;
-
-        for (const [hash, cached] of rdCache.entries()) {
-            if (cached.expiresAt <= now) {
-                rdCache.delete(hash);
-                cleanedCache++;
+        let cleanedCount = 0;
+        
+        for (const [ip, data] of this.rateLimitMap.entries()) {
+            if (now > data.resetTime + 300000) { // 5 minút po expiry
+                this.rateLimitMap.delete(ip);
+                cleanedCount++;
             }
         }
-
-        for (const [infoHash] of activeProcessing.entries()) {
-            activeProcessing.delete(infoHash);
-            cleanedProcessing++;
+        
+        if (cleanedCount > 0) {
+            console.log(`🧹 Cleanup: Odstránených ${cleanedCount} starých rate limit záznamov`);
         }
+    }
 
-        const oldStreamLimit = now - (5 * 60 * 1000);
-        for (const [streamKey, timestamp] of activeStreams.entries()) {
-            if (timestamp < oldStreamLimit) {
-                activeStreams.delete(streamKey);
-                cleanedStreams++;
+    /**
+     * Detekcia mobilného klienta
+     */
+    isMobileClient(req) {
+        const userAgent = req.headers['user-agent'] || '';
+        return /Mobile|Android|iPhone|iPad|iPod|BlackBerry|Windows Phone/i.test(userAgent);
+    }
+
+    /**
+     * Detekcia high-quality obsahu
+     */
+    isHighQualityContent(torrentInfo) {
+        const title = torrentInfo.title?.toLowerCase() || '';
+        const size = torrentInfo.size || 0;
+        
+        // Veľký súbor alebo high-quality indikátory
+        return size > 2 * 1024 * 1024 * 1024 || // > 2GB
+               title.includes('4k') ||
+               title.includes('2160p') ||
+               title.includes('1080p') ||
+               title.includes('bluray') ||
+               title.includes('remux');
+    }
+
+    /**
+     * Získanie záťaže serveru
+     */
+    getServerLoad() {
+        // Jednoduchá simulácia na základe počtu requestov
+        const now = Date.now();
+        const windowMs = 60 * 1000; // 1 minúta
+        
+        // Reset metrics ak je potreba
+        if (now - this.serverMetrics.lastReset > windowMs) {
+            const load = Math.min(100, (this.serverMetrics.totalRequests / 60) * 10); // Približná záťaž
+            this.serverMetrics = {
+                ...this.serverMetrics,
+                totalRequests: 0,
+                lastReset: now
+            };
+            return load;
+        }
+        
+        return Math.min(100, (this.serverMetrics.totalRequests / 30) * 10);
+    }
+
+    /**
+     * Reset metrics
+     */
+    resetMetrics() {
+        console.log(`📊 Hourly metrics reset. Last hour: ${JSON.stringify({
+            total: this.serverMetrics.totalRequests,
+            direct: this.serverMetrics.directRequests,
+            proxy: this.serverMetrics.proxyRequests,
+            hybrid: this.serverMetrics.hybridRequests,
+            errors: this.serverMetrics.errors
+        })}`);
+        
+        this.serverMetrics = {
+            totalRequests: 0,
+            directRequests: 0,
+            proxyRequests: 0,
+            hybridRequests: 0,
+            errors: 0,
+            lastReset: Date.now()
+        };
+    }
+
+    /**
+     * Formátovanie veľkosti súboru
+     */
+    formatFileSize(bytes) {
+        if (!bytes || bytes === 0) return 'unknown size';
+        
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(1024));
+        return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+    }
+
+    /**
+     * Logovanie stream requestov
+     */
+    logStreamRequest(status, method, torrentInfo, clientIp, duration, error = null) {
+        const logEntry = {
+            timestamp: new Date().toISOString(),
+            status: status,
+            method: method,
+            title: torrentInfo.title,
+            size: torrentInfo.size,
+            formattedSize: this.formatFileSize(torrentInfo.size),
+            clientIp: clientIp,
+            id: torrentInfo.id,
+            duration: Math.round(duration),
+            error: error
+        };
+        
+        const emoji = {
+            'SUCCESS': '✅',
+            'ERROR': '❌',
+            'FALLBACK_SUCCESS': '🔄'
+        }[status] || '📊';
+        
+        console.log(`${emoji} Stream ${status}: ${method} | ${logEntry.formattedSize} | ${logEntry.duration}ms | ${logEntry.title}`);
+        
+        if (config.LOGGING.ENABLE_ACCESS_LOG) {
+            // Tu by sa mohlo posielať do externého logovacieho systému
+        }
+    }
+
+    /**
+     * Získanie aktuálnych metrik
+     */
+    getMetrics() {
+        return {
+            ...this.serverMetrics,
+            rateLimitEntries: this.rateLimitMap.size,
+            cacheEntries: this.urlVerificationCache.size,
+            uptime: Date.now() - this.serverMetrics.lastReset
+        };
+    }
+
+    /**
+     * Health check endpoint
+     */
+    healthCheck() {
+        const metrics = this.getMetrics();
+        return {
+            status: 'healthy',
+            streamingMethod: this.streamingMethod,
+            version: '2.0.0',
+            metrics: metrics,
+            config: {
+                directStreaming: config.DIRECT_STREAMING,
+                proxyStreaming: config.PROXY_STREAMING,
+                hybridStreaming: config.HYBRID_STREAMING
             }
-        }
-
-        if (cleanedCache > 0 || cleanedProcessing > 0 || cleanedStreams > 0) {
-            console.log(`🧹 Streaming cleanup: ${cleanedCache} cache, ${cleanedProcessing} processing, ${cleanedStreams} streams`);
-        }
-    };
-
-    const getStats = () => ({
-        cache: rdCache.size,
-        activeProcessing: activeProcessing.size,
-        activeStreams: activeStreams.size
-    });
-
-    return {
-        getStreamKey,
-        streamFromUrl,
-        getStreamHeaders,
-        maybeCleanupCaches,
-        getUrlHeaders,
-        cacheRDError,
-        getRDError,
-        debugTorrent,
-        processRealDebridStream,
-        cleanupCache,
-        getStats,
-        getRealDebridStreamUrl,
-        buildCompleteMagnetLink,
-        getTorrentDataFromCache
-    };
+        };
+    }
 }
 
-module.exports = createStreamingManager;
+module.exports = StreamingManager;
