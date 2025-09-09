@@ -1,48 +1,172 @@
 {
-  "name": "sktorrent-hybrid",
-  "version": "1.0.0",
-  "description": "SKTorrent-Hybrid - Modularizovaný addon s pokročilou bezpečností",
+  "name": "sktorrent-hybrid-stremio-addon",
+  "version": "2.0.0",
+  "description": "SKTorrent.eu Hybrid Stremio Addon s Real-Debrid integráciou a direct streaming podporou",
   "main": "sktorrent-addon.js",
   "scripts": {
     "start": "node sktorrent-addon.js",
-    "dev": "nodemon sktorrent-addon.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "NODE_ENV=development nodemon sktorrent-addon.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint *.js",
+    "lint:fix": "eslint *.js --fix",
+    "validate-config": "node config.js",
+    "docker:build": "docker build -t sktorrent-hybrid .",
+    "docker:run": "docker run -p 7000:7000 --env-file .env sktorrent-hybrid",
+    "docker:compose": "docker-compose up -d",
+    "docker:compose:build": "docker-compose up --build -d",
+    "docker:compose:logs": "docker-compose logs -f sktorrent-hybrid",
+    "docker:compose:down": "docker-compose down",
+    "docker:compose:restart": "docker-compose restart sktorrent-hybrid",
+    "health-check": "curl -f http://localhost:7000/health || exit 1",
+    "benchmark": "node benchmark/streaming-benchmark.js",
+    "generate-api-key": "node -e \"console.log('API Key:', require('crypto').randomBytes(32).toString('hex'))\"",
+    "setup": "npm install && npm run validate-config && npm run generate-api-key"
   },
   "keywords": [
-    "stremio", 
-    "addon", 
-    "real-debrid", 
-    "sktorrent", 
-    "private", 
-    "optimized", 
-    "security",
-    "modular"
+    "stremio",
+    "addon",
+    "sktorrent",
+    "real-debrid",
+    "streaming",
+    "direct-streaming",
+    "proxy-streaming",
+    "hybrid",
+    "czech",
+    "slovak",
+    "torrent"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": {
+    "name": "Martin22",
+    "url": "https://github.com/Martin22"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Martin22/SKTorrent-Hybrid-Stremio-Addon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Martin22/SKTorrent-Hybrid-Stremio-Addon/issues"
+  },
+  "homepage": "https://github.com/Martin22/SKTorrent-Hybrid-Stremio-Addon#readme",
   "engines": {
-    "node": "20.9.0"
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
   },
   "dependencies": {
-    "axios": "^1.9.0",
-    "bncode": "^0.5.3",
-    "cheerio": "^1.0.0",
-    "entities": "^6.0.0",
-    "express": "^4.21.1",
-    "stremio-addon-sdk": "^1.6.10",
-    "diacritics": "^1.3.0",
-    "ejs": "^3.1.9",
-    "express-async-handler": "^1.2.0",
-    "parse-torrent": "^9.1.4"
+    "stremio-addon-sdk": "^1.6.6",
+    "express": "^4.18.2",
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4",
+    "express-rate-limit": "^7.1.5",
+    "crypto": "^1.0.1",
+    "url": "^0.11.3",
+    "querystring": "^0.2.1",
+    "path": "^0.12.7",
+    "fs": "^0.0.1-security",
+    "util": "^0.12.5",
+    "events": "^3.3.0",
+    "stream": "^0.0.2",
+    "http": "^0.0.1-security",
+    "https": "^1.0.0",
+    "zlib": "^1.0.5"
   },
   "devDependencies": {
-    "typescript": "^5.4.5",
-    "@types/node": "^20.11.30",
-    "@types/express": "^4.17.21",
-    "eslint": "^8.57.0",
-    "prettier": "^3.2.5",
+    "nodemon": "^3.0.2",
     "jest": "^29.7.0",
-    "ts-jest": "^29.1.2",
-    "@types/jest": "^29.5.12"
+    "supertest": "^6.3.3",
+    "eslint": "^8.54.0",
+    "eslint-config-standard": "^17.1.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-n": "^16.3.1",
+    "eslint-plugin-promise": "^6.1.1",
+    "@types/jest": "^29.5.8",
+    "prettier": "^3.1.0",
+    "husky": "^8.0.3",
+    "lint-staged": "^15.1.0"
+  },
+  "optionalDependencies": {
+    "redis": "^4.6.10",
+    "winston": "^3.11.0",
+    "winston-daily-rotate-file": "^4.7.1",
+    "node-cron": "^3.0.3",
+    "prometheus-client": "^1.0.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "*.js",
+      "!node_modules/**",
+      "!coverage/**",
+      "!jest.config.js"
+    ],
+    "coverageDirectory": "coverage",
+    "coverageReporters": [
+      "text",
+      "lcov",
+      "html"
+    ],
+    "testMatch": [
+      "**/tests/**/*.test.js",
+      "**/?(*.)+(spec|test).js"
+    ]
+  },
+  "eslintConfig": {
+    "extends": [
+      "standard"
+    ],
+    "env": {
+      "node": true,
+      "es2021": true,
+      "jest": true
+    },
+    "rules": {
+      "no-console": "off",
+      "prefer-const": "error",
+      "no-var": "error",
+      "object-shorthand": "error",
+      "prefer-template": "error"
+    }
+  },
+  "lint-staged": {
+    "*.js": [
+      "eslint --fix",
+      "prettier --write"
+    ]
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged",
+      "pre-push": "npm test"
+    }
+  },
+  "prettier": {
+    "semi": true,
+    "singleQuote": true,
+    "tabWidth": 2,
+    "trailingComma": "es5",
+    "printWidth": 100
+  },
+  "nodemonConfig": {
+    "watch": [
+      "*.js"
+    ],
+    "ignore": [
+      "node_modules/",
+      "logs/",
+      "cache/",
+      "coverage/"
+    ],
+    "ext": "js",
+    "env": {
+      "NODE_ENV": "development"
+    }
+  },
+  "config": {
+    "unsafe-perm": true
   }
 }
